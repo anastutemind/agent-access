@@ -134,6 +134,13 @@ enum Phase {
     NameInput {
         reply: oneshot::Sender<FingerprintVerificationReply>,
     },
+    /// Several credentials matched — waiting for the user to pick one by number.
+    CredentialChoice {
+        query: ap_client::CredentialQuery,
+        candidates: Vec<CredentialData>,
+        identity: ap_relay_protocol::IdentityFingerprint,
+        reply: oneshot::Sender<CredentialRequestReply>,
+    },
     /// Credential approval pending — carries the oneshot reply sender.
     CredentialApproval {
         query: ap_client::CredentialQuery,
@@ -214,6 +221,97 @@ async fn reload_connections() -> Vec<ConnectionInfo> {
     match FileConnectionCache::load_or_create("user_client") {
         Ok(cache) => cache.list().await,
         Err(_) => Vec::new(),
+    }
+}
+
+/// Show the credential that will be sent and prompt the user to approve it.
+async fn begin_credential_approval(
+    app: &mut App,
+    query: ap_client::CredentialQuery,
+    credential: CredentialData,
+    identity: IdentityFingerprint,
+    reply: oneshot::Sender<CredentialRequestReply>,
+) -> Phase {
+    let domain = credential
+        .domain
+        .clone()
+        .unwrap_or_else(|| query.to_string());
+    let found_msg = format!(
+        "Found: {} ({})",
+        credential.username.as_deref().unwrap_or("no username"),
+        credential.uri.as_deref().unwrap_or("no uri")
+    );
+    app.push_msg(MessageKind::Info, found_msg);
+    app.commands = &[];
+    // Reload from disk to pick up connections added after the event loop started.
+    let fresh_connections = reload_connections().await;
+    let device_label = fresh_connections
+        .iter()
+        .find(|s| s.fingerprint == identity)
+        .map(|s| {
+            s.name.clone().unwrap_or_else(|| {
+                hex::encode(s.fingerprint.0)
+                    .chars()
+                    .take(12)
+                    .collect::<String>()
+            })
+        })
+        .unwrap_or_else(|| "unknown device".to_string());
+    app.set_mode(Mode::CredentialConfirm {
+        title: format!("Send credential for {domain} to {device_label}?"),
+        description: Line::from(""),
+        auto_approve_minutes: 10,
+    });
+    app.footer = Line::from(Span::styled(
+        " Press [y] approve  [a] approve + auto-approve  [n] deny",
+        Style::default().fg(Color::Yellow),
+    ));
+    Phase::CredentialApproval {
+        query,
+        credential,
+        identity,
+        reply,
+    }
+}
+
+/// List several matching credentials and prompt the user to pick one by number.
+fn begin_credential_choice(
+    app: &mut App,
+    query: ap_client::CredentialQuery,
+    candidates: Vec<CredentialData>,
+    identity: IdentityFingerprint,
+    reply: oneshot::Sender<CredentialRequestReply>,
+) -> Phase {
+    app.push_msg(
+        MessageKind::Warning,
+        format!("{} logins match {query}:", candidates.len()),
+    );
+    for (n, credential) in candidates.iter().enumerate() {
+        app.push_msg(
+            MessageKind::Info,
+            format!(
+                "  {}) {} ({})",
+                n + 1,
+                credential.username.as_deref().unwrap_or("no username"),
+                credential.uri.as_deref().unwrap_or("no uri")
+            ),
+        );
+    }
+    app.set_mode(Mode::TextInput);
+    app.input_title = " Choose a login ";
+    app.commands = &[];
+    app.footer = Line::from(Span::styled(
+        format!(
+            " Type 1-{} and press Enter to choose (empty to deny)",
+            candidates.len()
+        ),
+        Style::default().fg(Color::Yellow),
+    ));
+    Phase::CredentialChoice {
+        query,
+        candidates,
+        identity,
+        reply,
     }
 }
 
@@ -421,6 +519,33 @@ async fn run_event_loop(
                                     app.enter_idle(idle_footer(), IDLE_COMMANDS);
                                 }
 
+                                // Choosing among several matching credentials
+                                (Phase::CredentialChoice { candidates, .. }, AppAction::Submit(s)) => {
+                                    let count = candidates.len();
+                                    let input = s.trim();
+                                    let choice = input.parse::<usize>().ok().filter(|n| (1..=count).contains(n));
+                                    if input.is_empty() {
+                                        let old_phase = std::mem::replace(&mut phase, Phase::Idle);
+                                        if let Phase::CredentialChoice { query, reply, .. } = old_phase {
+                                            let _ = reply.send(CredentialRequestReply {
+                                                approved: false,
+                                                credential: None,
+                                                credential_id: None,
+                                            });
+                                            app.push_msg(MessageKind::Error, format!("Credential denied for {query}"));
+                                        }
+                                        app.enter_idle(idle_footer(), IDLE_COMMANDS);
+                                    } else if let Some(n) = choice {
+                                        let old_phase = std::mem::replace(&mut phase, Phase::Idle);
+                                        if let Phase::CredentialChoice { query, mut candidates, identity, reply } = old_phase {
+                                            let credential = candidates.swap_remove(n - 1);
+                                            phase = begin_credential_approval(app, query, credential, identity, reply).await;
+                                        }
+                                    } else {
+                                        app.push_msg(MessageKind::Error, format!("Enter a number from 1 to {count}, or nothing to deny"));
+                                    }
+                                }
+
                                 // Credential approval
                                 (Phase::CredentialApproval { .. }, AppAction::CredentialConfirmed(approval)) => {
                                     let old_phase = std::mem::replace(&mut phase, Phase::Idle);
@@ -552,8 +677,10 @@ async fn run_event_loop(
                         }
                         UserClientRequest::CredentialRequest { query, identity, reply } => {
                             // Check auto-approval cache first
-                            if approval_cache.is_approved(&identity, &query) {
-                                match provider.lookup(&query) {
+                            let auto_approved = approval_cache.is_approved(&identity, &query);
+                            let lookup = provider.lookup(&query);
+                            if auto_approved && !matches!(lookup, LookupResult::Multiple(_)) {
+                                match lookup {
                                     LookupResult::Found(credential) => {
                                         let label = credential.domain.clone().unwrap_or_else(|| query.to_string());
                                         let cred_id = credential.credential_id.clone();
@@ -575,7 +702,8 @@ async fn run_event_loop(
                                     }
                                 }
                             } else {
-                                // Display the request
+                                // Display the request. Several matches always need the
+                                // user to choose, even when auto-approval is active.
                                 app.push_rich(Message::rich(
                                     MessageKind::Prompt,
                                     vec![
@@ -584,47 +712,12 @@ async fn run_event_loop(
                                     ],
                                 ));
 
-                                match provider.lookup(&query) {
+                                match lookup {
                                     LookupResult::Found(credential) => {
-                                        let domain = credential.domain.clone().unwrap_or_else(|| query.to_string());
-                                        let found_msg = format!(
-                                            "Found: {} ({})",
-                                            credential.username.as_deref().unwrap_or("no username"),
-                                            credential.uri.as_deref().unwrap_or("no uri")
-                                        );
-                                        app.push_msg(MessageKind::Info, found_msg);
-                                        app.commands = &[];
-                                        // Reload from disk to pick up connections added after the event loop started.
-                                        let fresh_connections = reload_connections().await;
-                                        let device_label = fresh_connections
-                                            .iter()
-                                            .find(|s| s.fingerprint == identity)
-                                            .map(|s| {
-                                                s.name.clone().unwrap_or_else(|| {
-                                                    hex::encode(s.fingerprint.0)
-                                                        .chars()
-                                                        .take(12)
-                                                        .collect::<String>()
-                                                })
-                                            })
-                                            .unwrap_or_else(|| "unknown device".to_string());
-                                        phase = Phase::CredentialApproval {
-                                            query,
-                                            credential,
-                                            identity,
-                                            reply,
-                                        };
-                                        app.set_mode(Mode::CredentialConfirm {
-                                            title: format!("Send credential for {domain} to {device_label}?"),
-                                            description: Line::from(""),
-                                            auto_approve_minutes: 10,
-                                        });
-                                        app.footer = Line::from(
-                                            Span::styled(
-                                                " Press [y] approve  [a] approve + auto-approve  [n] deny",
-                                                Style::default().fg(Color::Yellow),
-                                            )
-                                        );
+                                        phase = begin_credential_approval(app, query, credential, identity, reply).await;
+                                    }
+                                    LookupResult::Multiple(candidates) => {
+                                        phase = begin_credential_choice(app, query, candidates, identity, reply);
                                     }
                                     result @ (LookupResult::NotReady { .. } | LookupResult::NotFound) => {
                                         let label = query.to_string();

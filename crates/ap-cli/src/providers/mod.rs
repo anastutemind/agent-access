@@ -34,6 +34,8 @@ pub enum ProviderStatus {
 pub enum LookupResult {
     /// A credential was found.
     Found(CredentialData),
+    /// Several credentials match; the user must choose one.
+    Multiple(Vec<CredentialData>),
     /// No matching credential exists.
     NotFound,
     /// The provider is not ready (e.g. vault locked).

@@ -148,24 +148,94 @@ fn looks_like_session_key(input: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
 }
 
-/// Look up a credential from the Bitwarden CLI.
-fn lookup_credential(bw: &str, search: &str, session: Option<&str>) -> Option<CredentialData> {
+/// Look up credentials from the Bitwarden CLI.
+///
+/// `bw get item` refuses to pick when several items match, so in that case the
+/// matches are listed with `bw list items --search` and narrowed to logins
+/// whose URI host is exactly `search` (when any are). If more than one login
+/// remains, all of them are returned so the user can choose.
+fn lookup_credential(bw: &str, search: &str, session: Option<&str>) -> LookupResult {
+    match bw_command(bw, &["get", "item", search], session) {
+        Ok(stdout) => {
+            return serde_json::from_slice::<BwItem>(&stdout)
+                .ok()
+                .and_then(item_to_credential)
+                .map_or(LookupResult::NotFound, LookupResult::Found);
+        }
+        Err(stderr) if !stderr.contains("More than one result") => {
+            if !stderr.contains("Not found") {
+                info!("bw get item failed: {}", stderr);
+            }
+            return LookupResult::NotFound;
+        }
+        Err(_) => {}
+    }
+
+    let items: Vec<BwItem> = match bw_command(bw, &["list", "items", "--search", search], session)
+        .map(|stdout| serde_json::from_slice(&stdout))
+    {
+        Ok(Ok(items)) => items,
+        Ok(Err(e)) => {
+            info!("bw list items returned invalid JSON: {}", e);
+            return LookupResult::NotFound;
+        }
+        Err(stderr) => {
+            info!("bw list items failed: {}", stderr);
+            return LookupResult::NotFound;
+        }
+    };
+
+    let mut candidates: Vec<CredentialData> = narrow_to_host(items, search)
+        .into_iter()
+        .filter_map(item_to_credential)
+        .collect();
+    match candidates.len() {
+        0 => LookupResult::NotFound,
+        1 => LookupResult::Found(candidates.remove(0)),
+        _ => LookupResult::Multiple(candidates),
+    }
+}
+
+/// Keep only the logins among `items`; if any of them has a URI whose host is
+/// exactly `search`, keep only those.
+fn narrow_to_host(items: Vec<BwItem>, search: &str) -> Vec<BwItem> {
+    let logins: Vec<BwItem> = items.into_iter().filter(|i| i.login.is_some()).collect();
+    let host_matches = |item: &BwItem| {
+        item.login
+            .as_ref()
+            .and_then(|l| l.uris.as_ref())
+            .is_some_and(|uris| {
+                uris.iter().any(|u| {
+                    u.uri
+                        .as_deref()
+                        .and_then(domain_from_uri)
+                        .is_some_and(|h| h.eq_ignore_ascii_case(search))
+                })
+            })
+    };
+    if logins.iter().any(host_matches) {
+        logins.into_iter().filter(host_matches).collect()
+    } else {
+        logins
+    }
+}
+
+/// Run a `bw` subcommand, returning stdout on success or stderr on failure.
+fn bw_command(bw: &str, args: &[&str], session: Option<&str>) -> Result<Vec<u8>, String> {
     let mut cmd = Command::new(bw);
-    cmd.args(["get", "item", search]);
+    cmd.args(args);
     if let Some(key) = session {
         cmd.env("BW_SESSION", key);
     }
-    let output = cmd.output().ok()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("Not found") {
-            info!("bw get item failed: {}", stderr);
-        }
-        return None;
+    let output = cmd.output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).into_owned())
     }
+}
 
-    let item: BwItem = serde_json::from_slice(&output.stdout).ok()?;
+fn item_to_credential(item: BwItem) -> Option<CredentialData> {
     let login = item.login?;
 
     let uri = login
@@ -286,8 +356,7 @@ impl CredentialProvider for BitwardenProvider {
         let search = query.search_string();
 
         match lookup_credential(bw, search, self.session.as_ref().map(|s| s.expose_secret())) {
-            Some(cred) => LookupResult::Found(cred),
-            None => {
+            LookupResult::NotFound => {
                 // When there's no cached session the vault might still be unlocked
                 // natively (e.g. via BW_SESSION in the shell). Check `bw status`
                 // to distinguish "not found" from "vault locked".
@@ -301,6 +370,7 @@ impl CredentialProvider for BitwardenProvider {
                 }
                 LookupResult::NotFound
             }
+            result => result,
         }
     }
 }
@@ -308,6 +378,47 @@ impl CredentialProvider for BitwardenProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- narrow_to_host() ----------------------------------------------------
+
+    fn items(json: &str) -> Vec<BwItem> {
+        serde_json::from_str(json).expect("valid test JSON")
+    }
+
+    fn ids(items: Vec<BwItem>) -> Vec<String> {
+        items.into_iter().filter_map(|i| i.id).collect()
+    }
+
+    const GITHUB_ITEMS: &str = r#"[
+        {"id":"a","login":{"username":"alice@example.com","password":"p1","uris":[{"uri":"https://github.com/login"}]}},
+        {"id":"b","login":{"username":"bob","password":"p2","uris":[{"uri":"https://GitHub.com"}]}},
+        {"id":"c","login":{"username":"carol","password":"p3","uris":[{"uri":"https://gist.github.com"}]}},
+        {"id":"note"}
+    ]"#;
+
+    #[test]
+    fn narrow_keeps_exact_host_logins() {
+        assert_eq!(
+            ids(narrow_to_host(items(GITHUB_ITEMS), "github.com")),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn narrow_prefers_exact_subdomain() {
+        assert_eq!(
+            ids(narrow_to_host(items(GITHUB_ITEMS), "gist.github.com")),
+            ["c"]
+        );
+    }
+
+    #[test]
+    fn narrow_keeps_all_logins_when_no_exact_host() {
+        assert_eq!(
+            ids(narrow_to_host(items(GITHUB_ITEMS), "github")),
+            ["a", "b", "c"]
+        );
+    }
 
     // -- looks_like_session_key() -------------------------------------------
 

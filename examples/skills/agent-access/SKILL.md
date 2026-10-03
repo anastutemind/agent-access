@@ -109,3 +109,5 @@ Exit codes:
 
 If exit code is 3, try `aac connections clear sessions` and ask the user for a new token.
 If exit code is 4, confirm the domain with the user — they may store it under a different name.
+
+If several vault logins match the domain, the user picks one on the trusted device before approving, so the request may take a little longer. Wait for it rather than retrying.
